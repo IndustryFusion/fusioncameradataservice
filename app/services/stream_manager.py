@@ -32,9 +32,12 @@ Usage::
 """
 
 import logging
+import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
 import cv2
@@ -97,6 +100,10 @@ class CameraStream:
         self._frame: bytes = self._make_fallback()
         self._lock = threading.Lock()
 
+        # Card name learned on first open — used to re-locate the device
+        # after USB re-enumeration (camera gets a new /dev/videoN index).
+        self._card: str = ""
+
         # Capture state
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -141,6 +148,35 @@ class CameraStream:
         return self._status.is_capturing
 
     # ── Internal ──────────────────────────────────────────────────────────
+
+    def _get_card_name(self, path: str) -> str:
+        """Return the V4L2 card/model name for *path* via v4l2-ctl, or empty string."""
+        try:
+            out = subprocess.run(
+                ["v4l2-ctl", f"--device={path}", "--info"],
+                capture_output=True, text=True, timeout=3,
+            )
+            for line in out.stdout.splitlines():
+                if m := re.match(r"Card type\s*:\s*(.+)", line, re.I):
+                    return m.group(1).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _find_device_by_card(self, card: str) -> Optional[str]:
+        """
+        Scan /dev/video* for a device whose card name matches *card*.
+        Used to track a USB camera that re-enumerated to a new index.
+        Returns the path (e.g. '/dev/video2') or None.
+        """
+        scan_limit = max(config.MAX_CAMERAS, self._index + 1) * 2
+        for i in range(scan_limit):
+            path = f"/dev/video{i}"
+            if not Path(path).exists():
+                continue
+            if self._get_card_name(path) == card:
+                return path
+        return None
 
     def _make_fallback(self, error: Optional[str] = None) -> bytes:
         return generate_no_signal_frame(
@@ -203,6 +239,17 @@ class CameraStream:
                         self._index,
                         config.CAMERA_RECONNECT_DELAY,
                     )
+                    # USB camera may have re-enumerated to a different /dev/videoN.
+                    # Scan all devices for one with the same card/model name.
+                    if self._card:
+                        new_path = self._find_device_by_card(self._card)
+                        if new_path and new_path != self._path:
+                            logger.info(
+                                "Camera %d: device moved %s → %s (USB re-enumeration)",
+                                self._index, self._path, new_path,
+                            )
+                            self._path = new_path
+                            self._status.path = new_path
                     time.sleep(config.CAMERA_RECONNECT_DELAY)
                     continue
                 logger.info(
@@ -212,6 +259,12 @@ class CameraStream:
                     self._status.actual_height,
                     self._status.actual_fps,
                 )
+                # Learn the card name once so we can re-locate this camera
+                # if it re-enumerates to a different /dev/videoN after reconnect.
+                if not self._card:
+                    self._card = self._get_card_name(self._path)
+                    if self._card:
+                        logger.debug("Camera %d: card=%r", self._index, self._card)
 
             # ── Capture frame ─────────────────────────────────────────────
             t0 = time.monotonic()
