@@ -1,16 +1,12 @@
-# Core web framework
-flask==3.0.3
-gunicorn==22.0.0
-
 # Camera capture (headless — no display required)
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
 
-# Image generation for fallback frames
+# Image generation for "NO SIGNAL" fallback frames
 Pillow==10.4.0
 
-# SSL certificate generation
-cryptography==42.0.8
+# Push frames to NestJS socket.io endpoints
+python-socketio[client]==5.11.3
 
-# System information
+# System information (health endpoint)
 psutil==5.9.8

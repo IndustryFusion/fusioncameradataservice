@@ -114,13 +114,3 @@ def generate_no_signal_frame(
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=False)
     return buf.getvalue()
-
-
-def generate_mjpeg_boundary_chunk(frame_bytes: bytes) -> bytes:
-    """Wrap a JPEG frame in an MJPEG multipart boundary chunk."""
-    header = (
-        b"--frame\r\n"
-        b"Content-Type: image/jpeg\r\n"
-        b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
-    )
-    return header + frame_bytes + b"\r\n"

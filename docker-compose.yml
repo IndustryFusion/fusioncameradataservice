@@ -1,18 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # FusionCameraDataService  —  docker-compose.yml
-# Local development & single-host testing
+# Push-mode: gateway captures cameras and pushes to NestJS endpoints.
+# No consumer-facing HTTP server is exposed from this container.
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Usage:
-#   # Copy and edit the env file first
 #   cp .env.example .env
-#   nano .env        (set DEVICE_ID at minimum)
-#
-#   # Build and start
+#   nano .env   # set DEVICE_ID and PUSH_TARGETS at minimum
 #   docker compose up --build
-#
-#   # Test the stream in a browser (accept the self-signed cert warning):
-#   https://localhost:5443/api/v1/<YOUR_DEVICE_ID>/cameras
 #
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -31,34 +26,28 @@ services:
 
     # ── Environment ────────────────────────────────────────────────────────
     env_file:
-      - .env          # created from .env.example by the operator
+      - .env
     environment:
-      # These override anything in .env to ensure sane container defaults
-      - HOST=0.0.0.0
-      - PORT=5443
-      - SSL_ENABLED=${SSL_ENABLED:-true}
-      - SSL_SELF_SIGNED=${SSL_SELF_SIGNED:-true}
-      - SSL_CERT_PATH=/app/certs/cert.pem
-      - SSL_KEY_PATH=/app/certs/key.pem
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Push configuration — override in .env or here
+      - PUSH_TARGETS=${PUSH_TARGETS}          # required: e.g. http://nest1:3000
+      - PUSH_FPS=${PUSH_FPS:-15}
+      - PUSH_PATH=${PUSH_PATH:-/socket.io}
+      - PUSH_NAMESPACE=${PUSH_NAMESPACE:-/camera}
+      - PUSH_SECRET=${PUSH_SECRET:-}
+      - PUSH_RECONNECT_DELAY=${PUSH_RECONNECT_DELAY:-5.0}
+      # Camera selection — leave empty to auto-scan
+      - CAMERA_INDICES=${CAMERA_INDICES:-}
+      # Health server port (internal only — no consumer traffic)
+      - HEALTH_PORT=${HEALTH_PORT:-9090}
 
     # ── Ports ──────────────────────────────────────────────────────────────
+    # Only the health probe port is exposed; NestJS servers receive pushes
+    # so no inbound video traffic enters this container.
     ports:
-      - "${PORT:-5443}:5443"
-
-    # ── Volumes ────────────────────────────────────────────────────────────
-    volumes:
-      # Persist generated SSL certs between restarts
-      - certs_data:/app/certs
+      - "${HEALTH_PORT:-9090}:9090"
 
     # ── USB camera device access ───────────────────────────────────────────
-    # Mount all /dev/video* devices.  The 'video' group inside the container
-    # matches GID 44 so no root privileges are needed.
-    #
-    # Option A — privileged (easiest, less secure; fine for dev):
-    # privileged: true
-    #
-    # Option B — explicit device list (production-preferred):
     devices:
       - /dev/video0:/dev/video0
       # Uncomment additional cameras as needed:
@@ -75,12 +64,7 @@ services:
         - CMD
         - python
         - -c
-        - |
-          import urllib.request, ssl
-          ctx = ssl.create_default_context()
-          ctx.check_hostname = False
-          ctx.verify_mode = ssl.CERT_NONE
-          urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=4)
+        - "import urllib.request; urllib.request.urlopen('http://localhost:9090/health', timeout=4)"
       interval: 15s
       timeout: 5s
       retries: 3
@@ -92,7 +76,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  certs_data:
-    driver: local

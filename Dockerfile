@@ -12,7 +12,7 @@
 # ── Stage 1: build dependencies ───────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
-# System packages required by OpenCV and cryptography wheels
+# System packages required by OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         libglib2.0-0 \
@@ -20,8 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         libxrender1 \
         libgl1 \
-        libffi-dev \
-        libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create an isolated virtualenv so the runtime stage is clean
@@ -74,56 +72,36 @@ COPY app/          ./app/
 COPY main.py       ./main.py
 COPY requirements.txt ./requirements.txt
 
-# Certificate directory (mounted by docker / k3s or auto-generated at first start)
-RUN mkdir -p /app/certs && chown appuser:video /app/certs
-VOLUME ["/app/certs"]
+
 
 USER appuser
 
 # ── Runtime environment ───────────────────────────────────────────────────────
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV PORT=5443
-ENV HOST=0.0.0.0
-ENV SSL_ENABLED=true
-ENV SSL_SELF_SIGNED=true
-ENV SSL_CERT_PATH=/app/certs/cert.pem
-ENV SSL_KEY_PATH=/app/certs/key.pem
 ENV STREAM_WIDTH=1280
 ENV STREAM_HEIGHT=720
 ENV STREAM_FPS=30
 ENV STREAM_JPEG_QUALITY=85
 ENV MAX_CAMERAS=10
+ENV PUSH_FPS=15
+ENV PUSH_PATH=/socket.io
+ENV PUSH_NAMESPACE=/camera
+ENV PUSH_RECONNECT_DELAY=5.0
+ENV HEALTH_PORT=9090
 ENV LOG_LEVEL=INFO
 
-# DEVICE_ID must be provided by the operator at runtime — no default.
-# Failing to set it will cause main.py to exit immediately with a clear error.
+# DEVICE_ID and PUSH_TARGETS must be provided by the operator at runtime.
+# Failing to set them causes main.py to exit immediately with a clear error.
 
-EXPOSE 5443
+EXPOSE 9090
 
 # ── Healthcheck ───────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "\
-import urllib.request, ssl; \
-ctx = ssl.create_default_context(); \
-ctx.check_hostname = False; \
-ctx.verify_mode = ssl.CERT_NONE; \
-urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=4)" \
+import urllib.request; \
+urllib.request.urlopen('http://localhost:9090/health', timeout=4)" \
     || exit 1
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-# Use gunicorn in production for multi-threaded request handling.
-# --threads 4 allows concurrent MJPEG streams + REST calls per worker.
-CMD ["gunicorn", \
-     "--bind", "0.0.0.0:5443", \
-     "--workers", "1", \
-     "--threads", "4", \
-     "--worker-class", "gthread", \
-     "--timeout", "120", \
-     "--keep-alive", "5", \
-     "--keyfile",  "/app/certs/key.pem", \
-     "--certfile", "/app/certs/cert.pem", \
-     "--access-logfile", "-", \
-     "--error-logfile",  "-", \
-     "--log-level", "info", \
-     "main:application"]
+CMD ["python", "main.py"]

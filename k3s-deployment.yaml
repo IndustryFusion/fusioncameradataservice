@@ -8,13 +8,8 @@
 # exactly ONE pod per node — matching the "every machine has its own instance"
 # requirement.
 #
-# DEVICE_ID is populated from the node's name (spec.nodeName).  Rename nodes
-# to match your digital-twin IDs before deploying, e.g.:
-#
-#   kubectl label node <nodename> fusion.camera/role=gateway
-#   kubectl annotate node <nodename> fusion.camera/device-id=twin-factory-01
-#
-# Then set the correct value in the ConfigMap below or override per-node.
+# DEVICE_ID and PUSH_TARGETS are stored in a Kubernetes Secret so they can
+# differ per deployment without touching this manifest.
 #
 # Quick start
 # ───────────
@@ -22,14 +17,16 @@
 #      docker build -t <registry>/fusioncameradataservice:latest .
 #      docker push <registry>/fusioncameradataservice:latest
 #
-# 2. Create TLS secret (optional — leave empty to use auto-generated certs):
-#      kubectl -n fusioncamera create secret tls fusion-tls \
-#        --cert=path/to/cert.pem --key=path/to/key.pem
+# 2. Create the identity + push Secret:
+#      kubectl -n fusioncamera create secret generic fusioncamera-identity \
+#        --from-literal=DEVICE_ID=twin-factory-01 \
+#        --from-literal=PUSH_TARGETS=http://nest1:3000,http://nest2:3000 \
+#        --from-literal=PUSH_SECRET=your-shared-secret
 #
 # 3. Apply this manifest:
 #      kubectl apply -f k3s-deployment.yaml
 #
-# 4. Access the service on any node at https://<nodeIP>:5443
+# 4. Health probe available at http://<nodeIP>:9090/health
 # ──────────────────────────────────────────────────────────────────────────────
 
 ---
@@ -41,28 +38,31 @@ metadata:
     app.kubernetes.io/name: fusioncamera
 
 ---
-# ── ConfigMap: non-sensitive configuration ─────────────────────────────────
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: fusioncamera-config
   namespace: fusioncamera
 data:
-  PORT:                  "5443"
-  HOST:                  "0.0.0.0"
-  SSL_ENABLED:           "true"
-  SSL_SELF_SIGNED:       "true"
-  SSL_CERT_PATH:         "/app/certs/cert.pem"
-  SSL_KEY_PATH:          "/app/certs/key.pem"
-  SSL_CERT_DAYS:         "3650"
+  # ── Push ──────────────────────────────────────────────────────────────
+  # PUSH_TARGETS is set per-deployment or in a Secret; leave blank here
+  # so operators are forced to supply it explicitly.
+  PUSH_PATH:             "/socket.io"
+  PUSH_NAMESPACE:        "/camera"
+  PUSH_FPS:              "15"
+  PUSH_RECONNECT_DELAY:  "5.0"
+  # ── Camera ────────────────────────────────────────────────────────────
+  # CAMERA_INDICES: ""   # leave empty to auto-scan
   STREAM_WIDTH:          "1280"
   STREAM_HEIGHT:         "720"
   STREAM_FPS:            "30"
   STREAM_JPEG_QUALITY:   "85"
   MAX_CAMERAS:           "10"
   CAMERA_RECONNECT_DELAY: "2.0"
+  # ── Health ────────────────────────────────────────────────────────────
+  HEALTH_PORT:           "9090"
+  # ── Misc ──────────────────────────────────────────────────────────────
   LOG_LEVEL:             "INFO"
-  DEBUG:                 "false"
 
 ---
 # ── DaemonSet: one pod per gateway node ───────────────────────────────────
@@ -146,20 +146,24 @@ spec:
             - configMapRef:
                 name: fusioncamera-config
 
-          env:
-            # DEVICE_ID = this node's name (rename nodes to match digital-twin IDs)
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: DEVICE_ID
-              value: "$(NODE_NAME)"
+          # Non-sensitive tuning values (FPS, resolution, etc.)
+          envFrom:
+            - configMapRef:
+                name: fusioncamera-config
+          # Identity + push credentials — must be created before deploying:
+          #   kubectl -n fusioncamera create secret generic fusioncamera-identity \
+          #     --from-literal=DEVICE_ID=twin-factory-01 \
+          #     --from-literal=PUSH_TARGETS=http://nest1:3000,http://nest2:3000 \
+          #     --from-literal=PUSH_SECRET=your-shared-secret
+            - secretRef:
+                name: fusioncamera-identity
+          env: []
 
           # ── Ports ────────────────────────────────────────────────────────
           ports:
-            - name: https
-              containerPort: 5443
-              hostPort: 5443        # exposed on the node IP directly
+            - name: health
+              containerPort: 9090
+              hostPort: 9090
               protocol: TCP
 
           # ── Volume mounts ────────────────────────────────────────────────
@@ -167,9 +171,6 @@ spec:
             # Host /dev directory so all video devices are available
             - name: dev
               mountPath: /dev
-            # Persistent certificate directory (survives pod restarts)
-            - name: certs
-              mountPath: /app/certs
 
           # ── Security context ─────────────────────────────────────────────
           securityContext:
@@ -190,16 +191,10 @@ spec:
 
           # ── Liveness probe ────────────────────────────────────────────────
           livenessProbe:
-            exec:
-              command:
-                - python
-                - -c
-                - |
-                  import urllib.request, ssl
-                  ctx = ssl.create_default_context()
-                  ctx.check_hostname = False
-                  ctx.verify_mode = ssl.CERT_NONE
-                  urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=4)
+            httpGet:
+              path: /health
+              port: 9090
+              scheme: HTTP
             initialDelaySeconds: 15
             periodSeconds: 20
             timeoutSeconds: 6
@@ -207,16 +202,10 @@ spec:
 
           # ── Readiness probe ───────────────────────────────────────────────
           readinessProbe:
-            exec:
-              command:
-                - python
-                - -c
-                - |
-                  import urllib.request, ssl
-                  ctx = ssl.create_default_context()
-                  ctx.check_hostname = False
-                  ctx.verify_mode = ssl.CERT_NONE
-                  urllib.request.urlopen('https://localhost:5443/ready', context=ctx, timeout=4)
+            httpGet:
+              path: /ready
+              port: 9090
+              scheme: HTTP
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
@@ -228,16 +217,13 @@ spec:
           hostPath:
             path: /dev
             type: Directory
-        - name: certs
-          # emptyDir persists for the lifetime of the pod.
-          # Use a hostPath or PVC if you want certs to survive pod restarts.
-          emptyDir: {}
 
       # ── Termination ──────────────────────────────────────────────────────
       terminationGracePeriodSeconds: 15
 
 ---
-# ── Service: NodePort (redundant when hostNetwork=true, kept for reference) ──
+# ── Service: exposes the health port for node-level monitoring ───────────────
+# Video consumers connect to NestJS directly; no inbound video traffic here.
 apiVersion: v1
 kind: Service
 metadata:
@@ -246,15 +232,14 @@ metadata:
   labels:
     app.kubernetes.io/name: fusioncamera
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: fusioncamera
   ports:
-    - name: https
+    - name: health
       protocol: TCP
-      port: 5443
-      targetPort: 5443
-      nodePort: 30443    # Access via https://<any-node-IP>:30443
+      port: 9090
+      targetPort: 9090
 
 ---
 # ── RBAC: minimal ServiceAccount (no cluster permissions needed) ─────────────

@@ -1,33 +1,43 @@
 # FusionCameraDataService
 
-> HTTPS REST streaming service for USB/V4L2 cameras — built for digital-twin gateway nodes running Ubuntu 22.04 / 24.04.  
-> Every machine runs its own isolated instance identified by a **DEVICE_ID**.  Consumers must send this ID in every request.
+> Push-mode USB/V4L2 camera gateway for digital-twin nodes.  
+> Captures video from local cameras and **pushes** JPEG frames to one or more NestJS socket.io servers over a persistent connection.  Consumers connect to those NestJS servers — never to this process.
 
 ---
 
 ## Architecture overview
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Physical node  (Ubuntu 22/24 – K3s worker or bare-metal)        │
-│                                                                    │
-│   /dev/video0   ──┐                                               │
-│   /dev/video1   ──┤   StreamManager   ─── CameraStream threads   │
-│   /dev/videoN   ──┘        │                                      │
-│                             │  JPEG frame buffer (per camera)     │
-│                             ▼                                      │
-│              ┌──────────────────────────────┐                     │
-│              │  Flask / gunicorn HTTPS app   │                     │
-│              │  Port 5443  (TLS 1.2+)        │                     │
-│              │                               │                     │
-│              │  GET /health                  │ ← k8s liveness     │
-│              │  GET /ready                   │ ← k8s readiness    │
-│              │  GET /api/v1/{DEVICE_ID}/...  │ ← authenticated    │
-│              └──────────────────────────────┘                     │
-└──────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────┐
+  │  Gateway node  (Linux – K3s / bare-metal)  │
+  │                                            │
+  │  /dev/video0  ──┐                          │
+  │  /dev/video1  ──┤  StreamManager           │
+  │  /dev/videoN  ──┘  (capture threads)       │
+  │                       │                    │
+  │                       │ JPEG frame buffer  │
+  │                       ▼                    │
+  │              ┌──────────────────┐          │
+  │              │  StreamPusher(s) │          │
+  │              │  socket.io client│          │
+  │              └────────┬─────────┘          │
+  │                       │  push camera:frame │
+  │  :9090  /health ◄──── │                    │
+  │         /ready        │                    │
+  └───────────────────────┼────────────────────┘
+                          │
+          ┌───────────────┼──────────────────┐
+          ▼               ▼                  ▼
+   NestJS server 1  NestJS server 2   NestJS server N
+   (PUSH_TARGETS)   (PUSH_TARGETS)    (PUSH_TARGETS)
+          │
+   consumers connect here
+   (browser / mobile / dashboard)
 ```
 
-Each node's `DEVICE_ID` uniquely identifies its digital-twin. Requests with a wrong ID are rejected with **HTTP 403**.
+The gateway **never waits for a consumer**.  It establishes outbound socket.io connections to all configured NestJS servers and continuously pushes every frame.  NestJS buffers the latest frame and serves it to all subscribed consumers.
+
+Each pushed frame identifies itself with `deviceId` (from `DEVICE_ID` env) so a single NestJS server can receive from multiple gateways and route streams by ID.
 
 ---
 
@@ -36,27 +46,22 @@ Each node's `DEVICE_ID` uniquely identifies its digital-twin. Requests with a wr
 ```
 fusioncameradataservice/
 ├── app/
-│   ├── __init__.py              Flask app factory
-│   ├── config.py                All settings via environment variables
-│   ├── middleware/
-│   │   └── device_auth.py       @require_device_id decorator
-│   ├── routes/
-│   │   ├── health.py            /health  /ready  /metrics
-│   │   ├── devices.py           /cameras  /cameras/<n>  /streams
-│   │   └── stream.py            /cameras/<n>/stream  /snapshot
+│   ├── __init__.py
+│   ├── config.py                    All settings via environment variables
 │   ├── services/
-│   │   ├── device_scanner.py    V4L2 / USB camera discovery
-│   │   └── stream_manager.py    Thread-safe camera lifecycle + fallback
+│   │   ├── device_scanner.py        V4L2 / USB camera discovery
+│   │   ├── stream_manager.py        Thread-safe camera capture + fallback frames
+│   │   ├── stream_pusher.py         socket.io push client (one per target URL)
+│   │   └── health_server.py         Lightweight HTTP health server (:9090)
 │   └── utils/
-│       ├── fallback.py          "NO SIGNAL" JPEG frame generator
-│       └── ssl_utils.py         Self-signed TLS certificate generator
-├── main.py                      Entry point (dev + gunicorn WSGI callable)
+│       └── fallback.py              "NO SIGNAL" JPEG frame generator
+├── main.py                          Entry point
 ├── requirements.txt
-├── Dockerfile                   Multi-stage production image
-├── docker-compose.yml           Local development
-├── k3s-deployment.yaml          DaemonSet + Service + ConfigMap
-├── .env.example                 Template – copy to .env
-└── .gitignore
+├── Dockerfile                       Multi-stage production image
+├── docker-compose.yml
+├── k3s-deployment.yaml              DaemonSet + ConfigMap + Secret refs
+├── .env.example                     Copy to .env and configure
+└── README.md
 ```
 
 ---
@@ -65,181 +70,337 @@ fusioncameradataservice/
 
 ```bash
 # 1. Install dependencies
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Set DEVICE_ID (required)
+# 2. Required environment variables
 export DEVICE_ID=twin-factory-01
+export PUSH_TARGETS=http://your-nestjs-server:3000
 
-# 3. Start the service
-python main.py
+# 3. Start
+python3 main.py
 ```
-
-The service auto-generates a self-signed TLS cert in `./certs/` on first start.  
-Open `https://localhost:5443/` — accept the browser cert warning.
 
 ---
 
 ## Quick start (Docker)
 
 ```bash
-# 1. Configure
 cp .env.example .env
-# Edit .env and set DEVICE_ID
+# Edit .env — set DEVICE_ID and PUSH_TARGETS at minimum
 
-# 2. Build and run
 docker compose up --build
-
-# 3. Verify
-curl -k https://localhost:5443/health
 ```
-
-### Adding more cameras
-
-Edit `docker-compose.yml` → `services.fusioncamera.devices`:
-
-```yaml
-devices:
-  - /dev/video0:/dev/video0
-  - /dev/video1:/dev/video1
-```
-
----
-
-## API Reference
-
-All authenticated endpoints share the prefix `/api/v1/{device_id}`.  
-Replace `{device_id}` with the value of your `DEVICE_ID` environment variable.
-
-### Unauthenticated (no device ID required)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Liveness probe — always 200 |
-| GET | `/ready` | Readiness probe — 200 when fully initialised |
-| GET | `/metrics` | Process CPU / memory metrics |
-
-### Authenticated (device_id must match DEVICE_ID env var)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/{id}/info` | Service & stream configuration |
-| GET | `/api/v1/{id}/cameras` | List all detected USB cameras |
-| GET | `/api/v1/{id}/cameras/{n}` | Details for camera at `/dev/videoN` |
-| POST | `/api/v1/{id}/cameras/{n}/start` | Start background capture thread |
-| POST | `/api/v1/{id}/cameras/{n}/stop` | Stop and release camera |
-| **GET** | **`/api/v1/{id}/cameras/{n}/stream`** | **Live MJPEG HD stream** |
-| GET | `/api/v1/{id}/cameras/{n}/snapshot` | Single JPEG frame |
-| GET | `/api/v1/{id}/streams` | List all active stream threads |
-
-### Stream endpoint details
-
-```
-GET https://<nodeIP>:5443/api/v1/twin-factory-01/cameras/0/stream
-                                                          └── camera /dev/video0
-```
-
-Optional query parameters:
-
-| Param | Default | Description |
-|-------|---------|-------------|
-| `fps` | `STREAM_FPS` (30) | Requested stream frame rate (capped at configured max) |
-
-The stream uses **MJPEG** (`multipart/x-mixed-replace`) — compatible with:
-- Browsers (`<img src="...">`)
-- VLC, ffplay: `ffplay -i "https://host:5443/api/v1/DEVICE_ID/cameras/0/stream"`
-- OpenCV: `cv2.VideoCapture("https://host:5443/api/v1/DEVICE_ID/cameras/0/stream")`
-
-**Fallback behaviour**: if the camera is disconnected a live animated "NO SIGNAL" frame is served. The stream **never drops** — consumers do not need to reconnect.
-
----
-
-## Fallback / Fault tolerance
-
-| Scenario | Behaviour |
-|----------|-----------|
-| Camera never plugged in | NO SIGNAL frame with device ID + error |
-| Camera unplugged mid-stream | Fallback frame served; reconnect attempted every `CAMERA_RECONNECT_DELAY` seconds |
-| Camera comes back online | Real frames resume automatically in < 2 s |
-| Snapshot while offline | Returns fallback JPEG with HTTP 206 + `X-Is-Live: false` header |
-| DEVICE_ID missing at start | Process exits immediately with clear error message |
-| Wrong DEVICE_ID in request | HTTP 403 with JSON error |
-
----
-
-## K3s deployment
-
-### Prerequisites
-
-- K3s cluster (v1.28+)
-- Image pushed to a registry accessible by your nodes
-
-### Steps
-
-```bash
-# 1. Push image
-docker build -t <registry>/fusioncameradataservice:latest .
-docker push <registry>/fusioncameradataservice:latest
-
-# 2. Edit k3s-deployment.yaml — set your image name:
-#    containers[0].image: your-registry/fusioncameradataservice:latest
-
-# 3. Rename nodes to match your digital-twin IDs
-#    (nodes become the DEVICE_ID via spec.nodeName)
-kubectl label node k3s-node-01 fusion.camera/role=gateway
-
-# 4. Deploy
-kubectl apply -f k3s-deployment.yaml
-
-# 5. Check pods
-kubectl get pods -n fusioncamera -o wide
-
-# 6. Access stream from any matching node
-# DEVICE_ID = node name (check with: kubectl get nodes)
-curl -k https://<nodeIP>:5443/api/v1/<nodeName>/cameras
-```
-
-### Per-node DEVICE_ID override
-
-If you need a DEVICE_ID different from the node name, patch the DaemonSet:
-
-```bash
-kubectl -n fusioncamera patch daemonset fusioncamera \
-  --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/env/1/value","value":"my-custom-id"}]'
-```
-
-Or use a node label annotation and a mutating webhook (advanced).
 
 ---
 
 ## Configuration reference
 
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `DEVICE_ID` | Unique identifier for this gateway node — sent with every pushed frame |
+| `PUSH_TARGETS` | Comma-separated NestJS base URLs — e.g. `http://nest1:3000,http://nest2:3000` |
+
+### Push
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEVICE_ID` | **required** | Unique gateway identity |
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `5443` | HTTPS port |
-| `DEBUG` | `false` | Flask debug mode |
-| `SSL_ENABLED` | `true` | Enable HTTPS |
-| `SSL_SELF_SIGNED` | `true` | Auto-generate self-signed cert |
-| `SSL_CERT_DAYS` | `3650` | Auto-cert validity (days) |
-| `SSL_CERT_PATH` | `/app/certs/cert.pem` | Path to TLS certificate |
-| `SSL_KEY_PATH` | `/app/certs/key.pem` | Path to private key |
-| `STREAM_WIDTH` | `1280` | Requested capture width (HD) |
-| `STREAM_HEIGHT` | `720` | Requested capture height (HD) |
-| `STREAM_FPS` | `30` | Max stream frame rate |
+| `PUSH_PATH` | `/socket.io` | socket.io server path on the NestJS side |
+| `PUSH_NAMESPACE` | `/camera` | socket.io namespace (must match `@WebSocketGateway`) |
+| `PUSH_FPS` | `15` | Frames per second pushed to each target |
+| `PUSH_SECRET` | _(empty)_ | Shared secret sent in socket.io `auth` — NestJS validates in `handleConnection` |
+| `PUSH_RECONNECT_DELAY` | `5.0` | Seconds between reconnect attempts per target |
+
+### Camera selection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CAMERA_INDICES` | _(empty)_ | Comma-separated indices to push (e.g. `0,1`). Empty = auto-scan all |
+
+### Camera capture
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STREAM_WIDTH` | `1280` | Requested capture width |
+| `STREAM_HEIGHT` | `720` | Requested capture height |
+| `STREAM_FPS` | `30` | Internal capture loop rate |
 | `STREAM_JPEG_QUALITY` | `85` | JPEG quality (1–100) |
-| `MAX_CAMERAS` | `10` | Number of /dev/videoN to scan |
-| `CAMERA_RECONNECT_DELAY` | `2.0` | Seconds between reconnect attempts |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `MAX_CAMERAS` | `10` | Max `/dev/videoN` indices to probe |
+| `CAMERA_RECONNECT_DELAY` | `2.0` | Seconds between camera reconnect attempts |
+
+### Health server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEALTH_PORT` | `9090` | Port for `/health`, `/ready`, `/metrics` |
+
+### Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
+
+---
+
+## Health endpoints
+
+The internal HTTP server (`:9090`) is for k3s probes only — no video traffic.
+
+| Path | Status | Description |
+|------|--------|-------------|
+| `GET /health` | 200 | Always alive while the process is running |
+| `GET /ready` | 200 / 503 | 200 when ≥1 camera is actively capturing |
+| `GET /metrics` | 200 | CPU / memory snapshot |
+
+---
+
+## Fault tolerance
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Camera unplugged mid-run | Fallback "NO SIGNAL" frames pushed; reconnect every `CAMERA_RECONNECT_DELAY` s |
+| Camera comes back | Real frames resume automatically |
+| NestJS server unreachable | Pusher retries every `PUSH_RECONNECT_DELAY` s — no frames dropped on other targets |
+| NestJS server restarts | socket.io auto-reconnect re-establishes within seconds |
+| `DEVICE_ID` / `PUSH_TARGETS` missing | Process exits immediately with a descriptive error |
+
+---
+
+## K3s deployment
+
+```bash
+# 1. Build and push image
+docker build -t <registry>/fusioncameradataservice:latest .
+docker push <registry>/fusioncameradataservice:latest
+
+# 2. Create the identity + push credentials Secret
+#    Every key in this Secret becomes an env var inside the pod.
+kubectl -n fusioncamera create secret generic fusioncamera-identity \
+  --from-literal=DEVICE_ID=twin-factory-01 \
+  --from-literal=PUSH_TARGETS=http://nest1:3000,http://nest2:3000 \
+  --from-literal=PUSH_SECRET=your-shared-secret
+
+# 3. Set your image name in k3s-deployment.yaml, then apply
+kubectl apply -f k3s-deployment.yaml
+
+# 4. Verify
+kubectl get pods -n fusioncamera -o wide
+kubectl logs -n fusioncamera -l app=fusioncamera --tail=40
+```
+
+`DEVICE_ID` is set explicitly per deployment via the `fusioncamera-identity` Secret — not derived from node names.  To run multiple gateway nodes pointing at different cameras, create a separate namespace + Secret per node.
+
+---
+
+## NestJS receiver — integration guide
+
+The gateway pushes frames as socket.io events.  Your NestJS server must implement the following contract.
+
+### Install dependencies
+
+```bash
+npm install @nestjs/websockets @nestjs/platform-socket.io socket.io
+```
+
+### 1 — WebSocket Gateway
+
+```typescript
+// camera.gateway.ts
+import {
+  WebSocketGateway,
+  WebSocketServer,
+  SubscribeMessage,
+  MessageBody,
+  ConnectedSocket,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+
+@WebSocketGateway({
+  namespace: '/camera',       // must match PUSH_NAMESPACE (default: /camera)
+  cors: { origin: '*' },      // restrict in production
+})
+export class CameraGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server: Server;
+
+  // Latest frame per device+camera, keyed as "deviceId:cameraIndex"
+  private frames = new Map<string, Buffer>();
+
+  // ── Incoming connection from gateway ──────────────────────────────────────
+
+  handleConnection(client: Socket) {
+    const { deviceId, secret } = client.handshake.auth as {
+      deviceId?: string;
+      secret?: string;
+    };
+
+    // Validate shared secret (compare with your PUSH_SECRET env var)
+    const expected = process.env.CAMERA_PUSH_SECRET ?? '';
+    if (expected && secret !== expected) {
+      client.disconnect(true);
+      return;
+    }
+
+    if (!deviceId) {
+      client.disconnect(true);
+      return;
+    }
+
+    client.data.deviceId = deviceId;
+    console.log(`[CameraGateway] gateway connected: ${deviceId}`);
+  }
+
+  handleDisconnect(client: Socket) {
+    console.log(`[CameraGateway] gateway disconnected: ${client.data.deviceId}`);
+  }
+
+  // ── Receive pushed frame ───────────────────────────────────────────────────
+
+  @SubscribeMessage('camera:frame')
+  handleFrame(
+    @MessageBody()
+    data: {
+      deviceId: string;    // gateway DEVICE_ID
+      cameraIndex: number; // /dev/videoN index
+      timestamp: number;   // Unix epoch (seconds, float)
+      jpeg: Buffer;        // raw JPEG bytes
+    },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const key = `${data.deviceId}:${data.cameraIndex}`;
+    this.frames.set(key, Buffer.from(data.jpeg));
+
+    // Broadcast the latest frame to all subscribed consumers in the room
+    this.server.to(key).emit('camera:frame', {
+      deviceId: data.deviceId,
+      cameraIndex: data.cameraIndex,
+      timestamp: data.timestamp,
+      jpeg: data.jpeg,
+    });
+  }
+
+  // ── Consumer subscription (browser / app joins a room) ────────────────────
+
+  @SubscribeMessage('camera:subscribe')
+  handleSubscribe(
+    @MessageBody() data: { deviceId: string; cameraIndex: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const key = `${data.deviceId}:${data.cameraIndex}`;
+    client.join(key);
+
+    // Send the latest buffered frame immediately so the consumer doesn't
+    // need to wait for the next push cycle
+    const latest = this.frames.get(key);
+    if (latest) {
+      client.emit('camera:frame', {
+        deviceId: data.deviceId,
+        cameraIndex: data.cameraIndex,
+        timestamp: Date.now() / 1000,
+        jpeg: latest,
+      });
+    }
+  }
+
+  @SubscribeMessage('camera:unsubscribe')
+  handleUnsubscribe(
+    @MessageBody() data: { deviceId: string; cameraIndex: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    client.leave(`${data.deviceId}:${data.cameraIndex}`);
+  }
+}
+```
+
+### 2 — Register the gateway in your module
+
+```typescript
+// camera.module.ts
+import { Module } from '@nestjs/common';
+import { CameraGateway } from './camera.gateway';
+
+@Module({
+  providers: [CameraGateway],
+})
+export class CameraModule {}
+```
+
+```typescript
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { CameraModule } from './camera/camera.module';
+
+@Module({
+  imports: [CameraModule],
+})
+export class AppModule {}
+```
+
+### 3 — HTTP snapshot endpoint (optional)
+
+Expose the latest buffered frame as a plain JPEG over HTTP so browser `<img>` tags and REST clients can consume it without a socket.io library:
+
+```typescript
+// camera.controller.ts
+import { Controller, Get, Param, Res, NotFoundException } from '@nestjs/common';
+import { Response } from 'express';
+import { CameraGateway } from './camera.gateway';
+
+@Controller('cameras')
+export class CameraController {
+  constructor(private readonly gateway: CameraGateway) {}
+
+  @Get(':deviceId/:cameraIndex/snapshot')
+  snapshot(
+    @Param('deviceId') deviceId: string,
+    @Param('cameraIndex') cameraIndex: string,
+    @Res() res: Response,
+  ) {
+    const key = `${deviceId}:${cameraIndex}`;
+    const frame = this.gateway.frames.get(key);
+    if (!frame) throw new NotFoundException('No frame available yet');
+
+    res.set({
+      'Content-Type': 'image/jpeg',
+      'Content-Length': frame.length,
+      'Cache-Control': 'no-cache',
+    });
+    res.send(frame);
+  }
+}
+```
+
+> Make `frames` public (or expose it via a service) for the controller to access it.
+
+### 4 — Browser consumer example
+
+```typescript
+import { io } from 'socket.io-client';
+
+const socket = io('http://your-nestjs-server:3000/camera');
+
+socket.emit('camera:subscribe', { deviceId: 'twin-factory-01', cameraIndex: 0 });
+
+socket.on('camera:frame', ({ jpeg }: { jpeg: ArrayBuffer }) => {
+  const blob = new Blob([jpeg], { type: 'image/jpeg' });
+  const url  = URL.createObjectURL(blob);
+  const img  = document.getElementById('camera') as HTMLImageElement;
+  const prev = img.src;
+  img.src = url;
+  if (prev) URL.revokeObjectURL(prev);
+});
+```
 
 ---
 
 ## Security notes
 
-- Device ID validation uses `hmac.compare_digest` (constant-time) to prevent timing oracle attacks.
-- Private key files are created with `chmod 600`.
-- The container runs as a non-root user in the `video` group (UID 1001, GID 44) — `privileged: true` is only needed for raw USB device access on K3s; remove it if you mount specific devices instead.
-- TLS 1.2 minimum enforced; TLS 1.0/1.1 disabled.
-- `no-new-privileges` security option applied in Docker Compose.
+- `PUSH_SECRET` is validated by NestJS in `handleConnection` via constant-time comparison — always set it in production and store it in a Kubernetes Secret (not a ConfigMap).
+- The gateway makes **outbound-only** connections — no inbound ports need to be opened on the gateway node besides the internal health port.
+- The container runs as a non-root user in the `video` group (UID 1001, GID 44). `privileged: true` in K3s is needed only for raw USB device access; replace with an explicit device list for hardened nodes.
+- `no-new-privileges` security option is set in Docker Compose.
+

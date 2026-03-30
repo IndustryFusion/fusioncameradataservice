@@ -35,12 +35,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Generator, Optional
+from typing import Dict, Optional
 
 import cv2
 
 from app.config import config
-from app.utils.fallback import generate_no_signal_frame, generate_mjpeg_boundary_chunk
+from app.utils.fallback import generate_no_signal_frame
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,7 @@ class CameraStream:
         """Main loop: open → capture → encode → buffer.  Reconnect on failure."""
         cap: Optional[cv2.VideoCapture] = None
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY]
+        frame_interval = 1.0 / max(1, config.STREAM_FPS)
 
         while self._running:
             # ── (Re-)open camera ──────────────────────────────────────────
@@ -202,6 +203,7 @@ class CameraStream:
                 )
 
             # ── Capture frame ─────────────────────────────────────────────
+            t0 = time.monotonic()
             ret, frame = cap.read()
             if not ret or frame is None:
                 logger.warning("Camera %d: read failed — will reconnect", self._index)
@@ -228,6 +230,13 @@ class CameraStream:
             self._status.frame_count += 1
             self._status.last_frame_at = time.time()
             self._status.last_error = None
+
+            # Pace the capture loop to STREAM_FPS to avoid CPU saturation
+            # and prevent stale frames from accumulating in the camera buffer.
+            elapsed = time.monotonic() - t0
+            sleep_time = frame_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         # ── Cleanup ───────────────────────────────────────────────────────
         if cap is not None:
@@ -289,29 +298,6 @@ class StreamManager:
         fallback frame (the first real frame will arrive within milliseconds).
         """
         return self.get_or_create(index).get_frame()
-
-    def mjpeg_generator(
-        self, index: int, fps: Optional[int] = None
-    ) -> Generator[bytes, None, None]:
-        """
-        Yield MJPEG multipart chunks at *fps* rate for the given camera index.
-
-        Continues indefinitely; the Flask route tears down the generator when
-        the client disconnects.
-        """
-        target_fps = fps or config.STREAM_FPS
-        interval = 1.0 / max(1, target_fps)
-
-        cam = self.get_or_create(index)
-
-        while True:
-            t0 = time.monotonic()
-            frame = cam.get_frame()
-            yield generate_mjpeg_boundary_chunk(frame)
-            elapsed = time.monotonic() - t0
-            sleep = interval - elapsed
-            if sleep > 0:
-                time.sleep(sleep)
 
     def shutdown(self) -> None:
         """Stop all camera streams — called during application teardown."""
