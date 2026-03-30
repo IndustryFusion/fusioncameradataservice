@@ -104,7 +104,7 @@ class Config:
     STREAM_JPEG_QUALITY: int = field(
         default_factory=lambda: _env_int("STREAM_JPEG_QUALITY", 85)
     )
-    MAX_CAMERAS: int = field(default_factory=lambda: _env_int("MAX_CAMERAS", 10))
+    MAX_CAMERAS: int = field(default_factory=lambda: _env_int("MAX_CAMERAS", 32))
     CAMERA_RECONNECT_DELAY: float = field(
         default_factory=lambda: _env_float("CAMERA_RECONNECT_DELAY", 2.0)
     )

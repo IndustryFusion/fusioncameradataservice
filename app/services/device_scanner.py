@@ -147,13 +147,39 @@ def scan_cameras(max_devices: int = 10) -> list[CameraDevice]:
     Return a list of :class:`CameraDevice` for every V4L2 video device found.
 
     Probing order:
-    1. Enumerate /dev/video0 … /dev/video{max_devices-1}
+    1. Enumerate all /dev/video* nodes via sysfs (no fixed upper limit)
     2. Query metadata via v4l2-ctl (if installed)
     3. Quick OpenCV open-and-probe for accessibility and native properties
+
+    ``max_devices`` is kept as a parameter for API compatibility but no longer
+    limits discovery — all nodes present in /sys/class/video4linux are probed.
     """
     devices: list[CameraDevice] = []
 
-    for idx in range(max_devices):
+    # Enumerate via sysfs so we find cameras at any /dev/videoN index
+    # (e.g. /dev/video10, /dev/video11) regardless of max_devices value.
+    sysfs_root = Path("/sys/class/video4linux")
+    try:
+        sysfs_nodes = sorted(
+            sysfs_root.iterdir(),
+            key=lambda p: int(re.sub(r"\D", "", p.name) or 0),
+        )
+    except OSError:
+        sysfs_nodes = []
+
+    seen_indices: set[int] = set()
+    for node_dir in sysfs_nodes:
+        m = re.fullmatch(r"video(\d+)", node_dir.name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        seen_indices.add(idx)
+
+    if not seen_indices:
+        # sysfs unavailable — fall back to sequential probe up to max_devices
+        seen_indices = set(range(max_devices))
+
+    for idx in sorted(seen_indices):
         path = f"/dev/video{idx}"
         if not Path(path).exists():
             continue
