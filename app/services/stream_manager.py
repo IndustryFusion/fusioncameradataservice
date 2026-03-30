@@ -158,6 +158,7 @@ class CameraStream:
             cap = cv2.VideoCapture(self._path)
             if not cap.isOpened():
                 cap.release()
+                logger.debug("Camera %d: %s not ready yet", self._index, self._path)
                 return None
             # Request HD resolution
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.STREAM_WIDTH)
@@ -197,6 +198,11 @@ class CameraStream:
                         self._frame = self._make_fallback(
                             f"Device {self._path} unavailable"
                         )
+                    logger.warning(
+                        "Camera %d: reconnect attempt failed — retrying in %.1f s",
+                        self._index,
+                        config.CAMERA_RECONNECT_DELAY,
+                    )
                     time.sleep(config.CAMERA_RECONNECT_DELAY)
                     continue
                 logger.info(
