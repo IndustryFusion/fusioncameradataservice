@@ -39,6 +39,11 @@ from typing import Dict, Optional
 
 import cv2
 
+# Suppress OpenCV's internal V4L2 WARN messages (e.g. VIDIOC_REQBUFS errno=19
+# "No such device") that fire when a USB camera is physically disconnected
+# mid-stream and the kernel buffers can no longer be released.
+cv2.setLogLevel(2)  # 0=SILENT 1=FATAL 2=ERROR 3=WARN(default) 4=INFO
+
 from app.config import config
 from app.utils.fallback import generate_no_signal_frame
 
