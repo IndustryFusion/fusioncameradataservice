@@ -150,7 +150,21 @@ class CameraStream:
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _get_card_name(self, path: str) -> str:
-        """Return the V4L2 card/model name for *path* via v4l2-ctl, or empty string."""
+        """
+        Return the V4L2 card/model name for *path*.
+        Reads from sysfs first (no external tool needed), then falls back
+        to v4l2-ctl.  Returns an empty string if nothing is found.
+        """
+        # Fast path: sysfs — available on all Linux kernels with V4L2
+        try:
+            node = Path(path).name  # e.g. "video10"
+            sysfs_name = Path(f"/sys/class/video4linux/{node}/name").read_text().strip()
+            if sysfs_name:
+                return sysfs_name
+        except OSError:
+            pass
+
+        # Fallback: v4l2-ctl
         try:
             out = subprocess.run(
                 ["v4l2-ctl", f"--device={path}", "--info"],
@@ -167,12 +181,25 @@ class CameraStream:
         """
         Scan /dev/video* for a device whose card name matches *card*.
         Used to track a USB camera that re-enumerated to a new index.
-        Returns the path (e.g. '/dev/video2') or None.
+        Returns the first matching capture-capable path, or None.
+        Skips paths already owned by other CameraStream instances.
         """
-        scan_limit = max(config.MAX_CAMERAS, self._index + 1) * 2
-        for i in range(scan_limit):
-            path = f"/dev/video{i}"
-            if not Path(path).exists():
+        # Collect paths that are already claimed by other streams so we
+        # don't accidentally steal a sibling camera's device.
+        claimed = {
+            cam._path for cam in stream_manager._cameras.values() if cam is not self
+        }
+
+        # Enumerate all known V4L2 nodes via sysfs (avoids guessing a scan limit)
+        sysfs_root = Path("/sys/class/video4linux")
+        try:
+            nodes = sorted(sysfs_root.iterdir(), key=lambda p: int(re.sub(r"\D", "", p.name) or 0))
+        except OSError:
+            nodes = []
+
+        for node_dir in nodes:
+            path = f"/dev/{node_dir.name}"
+            if not Path(path).exists() or path in claimed:
                 continue
             if self._get_card_name(path) == card:
                 return path
