@@ -10,7 +10,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build dependencies ───────────────────────────────────────────────
-FROM python:3.11-slim AS builder
+FROM python:3.15-slim AS builder
 
 # System packages required by OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,7 +33,7 @@ RUN pip install --upgrade pip && \
 
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 LABEL org.opencontainers.image.title="FusionCameraDataService"
 LABEL org.opencontainers.image.description="USB camera HTTPS streaming service for digital-twin gateways"
