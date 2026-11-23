@@ -6,7 +6,7 @@ numpy==1.26.4
 Pillow==10.4.0
 
 # Push frames to NestJS socket.io endpoints
-python-socketio[client]==5.11.3
+python-socketio[client]==5.18.1
 
 # System information (health endpoint)
 psutil==5.9.8
