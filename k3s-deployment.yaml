@@ -109,7 +109,7 @@ spec:
       # ── Init container: ensure /dev/video* is accessible ──────────────
       initContainers:
         - name: check-video-devices
-          image: busybox:1.36
+          image: busybox:1.38
           command:
             - sh
             - -c
