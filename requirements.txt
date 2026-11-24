@@ -1,6 +1,6 @@
 # Camera capture (headless — no display required)
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
+opencv-python-headless==4.14.0.94
+numpy==2.4.6
 
 # Image generation for "NO SIGNAL" fallback frames
 Pillow==10.4.0
