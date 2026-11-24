@@ -10,7 +10,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build dependencies ───────────────────────────────────────────────
-FROM python:3.11-slim AS builder
+# Security baseline (ifx-docs 14.1, step 4): base image pinned to an exact tag
+# (same Python 3.11 and Debian trixie that python:3.11-slim resolves to today).
+FROM python:3.11.18-slim-trixie AS builder
 
 # System packages required by OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,7 +35,7 @@ RUN pip install --upgrade pip && \
 
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
+FROM python:3.11.18-slim-trixie AS runtime
 
 LABEL org.opencontainers.image.title="FusionCameraDataService"
 LABEL org.opencontainers.image.description="USB camera HTTPS streaming service for digital-twin gateways"
